@@ -7,6 +7,7 @@
 #ifndef smmu500_H
 #define smmu500_H
 
+#include <optional>
 #include <systemc>
 #include <cci_configuration>
 #include <cciutils.h>
@@ -48,7 +49,12 @@
 #define SMMU_MAX_SMR  224
 #define SMMU_MAX_TBU  16
 #define SMMU_VA_WIDTH 32
-#define SMMU_ADDRMASK ((1ULL << 12) - 1)
+#define SMMU_CSID_WIDTH 4
+#define SMMU_OFFSETMASK ((1ULL << 12) - 1)
+#define SMMU_ADDRMASK (~SMMU_OFFSETMASK)
+
+#define SMMU_LOW(val)  (static_cast<std::uint32_t>((val) & 0xffff'ffff))
+#define SMMU_HIGH(val) (static_cast<std::uint32_t>((val) >> 32))
 
 namespace gs {
 
@@ -151,6 +157,141 @@ private:
         AddressSize, // Input, output, or table address exceeds its configured width.
     };
 
+    /* S2CR.TYPE selects the action for a matched stream. */
+    enum class S2CRType : std::uint8_t {
+        TcbIdx = 0b00,
+        Bypass = 0b01,
+        Fault = 0b10,
+        Reserved = 0b11,
+    };
+
+    enum class CBARType : std::uint8_t {
+        Stage2Ctx = 0b00,
+        Stage1CtxStage2Bypass = 0b01,
+        Stage1CtxStage2Fault = 0b10,
+        Stage1AndStage2Ctx = 0b11,
+    };
+
+    class Desc {
+    public:
+        class TableAttrs {
+            std::uint64_t raw = 0;
+
+        public:
+            TableAttrs(std::uint64_t raw) : raw(raw) {}
+
+            void operator|=(TableAttrs other)
+            {
+                raw |= other.raw;
+            }
+
+            constexpr bool pxn() const          { return raw & (1ULL << 59); }
+            constexpr bool xn() const           { return raw & (1ULL << 60); }
+            constexpr bool deny_user() const    { return raw & (1ULL << 61); }
+            constexpr bool deny_write() const   { return raw & (1ULL << 62); }
+            constexpr bool non_secure() const   { return raw & (1ULL << 63); }
+        };
+
+        class Stage1Attrs {
+            std::uint64_t raw = 0;
+
+        public:
+            Stage1Attrs(std::uint64_t raw) : raw(raw) {}
+
+            constexpr bool access_flag() const  { return raw & (1ULL << 10); }
+            constexpr bool allow_user() const   { return raw & (1ULL <<  6); }
+            constexpr bool read_only() const    { return raw & (1ULL <<  7); }
+            constexpr bool pxn() const          { return raw & (1ULL << 53); }
+            constexpr bool xn() const           { return raw & (1ULL << 54); }
+        };
+
+        enum class Stage2Access : std::uint8_t {
+            None        = 0b00,
+            ReadOnly    = 0b01,
+            WriteOnly   = 0b10,
+            ReadWrite   = 0b11,
+        };
+
+        class Stage2Attrs {
+            std::uint64_t raw = 0;
+
+        public:
+            Stage2Attrs(std::uint64_t raw) : raw(raw) {}
+
+            constexpr bool access_flag() const  { return raw & (1ULL << 10); }
+            constexpr bool xn() const           { return raw & (1ULL << 54); }
+
+            constexpr Stage2Access access() const   { return Stage2Access((raw >> 6) & 3); }
+        };
+
+        enum class Type : std::uint8_t {
+            Block   = 0b01,
+            Table   = 0b11, // level 0,1,2
+            Page    = 0b11, // level 3
+        };
+
+        static bool is_valid(std::uint64_t desc, std::uint32_t level)
+        {
+            if (level == 3) {
+                return (desc & 3) == 3;
+            } else {
+                return (desc & 1);
+            }
+        }
+
+        static std::optional<Desc> from_raw(std::uint64_t desc, std::uint32_t level)
+        {
+            if (!is_valid(desc, level)) {
+                return std::nullopt;
+            }
+
+            return Desc{desc, level};
+        }
+
+        Type type()
+        {
+            return m_type;
+        }
+
+        TableAttrs table_attrs() {
+            sc_assert(is_table());
+            return TableAttrs(m_raw);
+        }
+
+        Stage1Attrs stage1_attrs() {
+            sc_assert(is_block() || is_page());
+            return Stage1Attrs(m_raw);
+        }
+
+        Stage2Attrs stage2_attrs() {
+            sc_assert(is_block() || is_page());
+            return Stage2Attrs(m_raw);
+        }
+
+        bool is_table() const {
+            return m_level < 3 && m_type == Type::Table;
+        }
+
+        bool is_page() const {
+            return m_level == 3 && m_type == Type::Page;
+        }
+
+        bool is_block() const {
+            return m_level < 3 && m_type == Type::Block;
+        }
+
+    private:
+        Desc(std::uint64_t raw, std::uint32_t level)
+            : m_raw(raw)
+            , m_type(Type(m_raw & 3))
+            , m_level(level)
+        {}
+
+        std::uint64_t m_raw;
+        std::uint32_t m_level;
+        Type m_type;
+    };
+
     static constexpr uint32_t CB_FSR_TF_MASK = 1u << 1;
     static constexpr uint32_t CB_FSR_AFF_MASK = 1u << 2;
     static constexpr uint32_t CB_FSR_PF_MASK = 1u << 3;
@@ -199,13 +340,13 @@ private:
         if (m_dma_dmi.ptr != nullptr && m_dma_dmi.end >= start && m_dma_dmi.start <= end) m_dma_dmi = DmaDmi{};
     }
 
-    typedef struct PageAttr {
+    struct PageAttr {
         uint64_t pa;
         unsigned int block : 1;
         unsigned int rd : 1;
         unsigned int wr : 1;
         unsigned int ns : 1;
-    } PageAttr;
+    };
 
     // Request attributes propagated into the translation walk and fault syndrome.
     struct FaultAttrs {
@@ -220,8 +361,9 @@ private:
         uint8_t bid = 0;                  // Bus ID, reported in FSYNR1.BID.
     };
 
-    typedef struct TransReq {
+    struct TransReq {
         uint64_t va;
+        uint64_t client_va; // requested VA
         uint64_t tcr[3];
         uint64_t ttbr[3][2];
         uint32_t access;
@@ -240,9 +382,11 @@ private:
         bool address_translation = false;
         bool asynchronous = false;
         bool nested = false;
+        bool s1ptwf = false;
         bool internal_walk = false;
         bool suppress_fault = false;
         bool ipafar_valid = false;
+        unsigned fault_level = 0;
         uint64_t ipafar = 0;
         unsigned int s1_cb = 0;
         uint8_t mid = 0;
@@ -250,11 +394,30 @@ private:
         uint8_t bid = 0;
         uint64_t trace_id = 0;
         uint64_t sid = 0;
-    } TransReq;
+    };
 
-    static uint32_t extract32(uint32_t val, int start, int length) { return (val >> start) & ((1u << length) - 1); }
+    struct SMMUAddr {
+        // because we cast va to uint32_t
+        static_assert(SMMU_VA_WIDTH == 32);
 
-    static uint64_t extract64(uint64_t val, int start, int length) { return (val >> start) & ((1ULL << length) - 1); }
+        std::uint64_t& raw;
+
+        std::uint32_t va() const {
+            return static_cast<std::uint32_t>(raw);
+        }
+
+        std::uint8_t csid() const {
+            return static_cast<std::uint8_t>((raw >> SMMU_VA_WIDTH) & 0xf);
+        }
+
+        bool is_high_addr() const {
+            return (raw >> (SMMU_VA_WIDTH + SMMU_CSID_WIDTH)) != 0;
+        }
+    };
+
+    static constexpr uint32_t extract32(uint32_t val, int start, int length) { return (val >> start) & ((1u << length) - 1); }
+
+    static constexpr uint64_t extract64(uint64_t val, int start, int length) { return (val >> start) & ((1ULL << length) - 1); }
 
     static int clz32(uint32_t val) { return val ? __builtin_clz(val) : 32; }
 
@@ -294,6 +457,7 @@ private:
                                      bool record_fault = true)
     {
         if (record_fault) smmu500_record_global_fault(fault_mask, non_secure);
+
         if (global_control & SCR0_GFRE_MASK) {
             ret.perm = IOMMU_NONE;
         } else {
@@ -317,6 +481,9 @@ private:
         }
         if (const auto* secure = txn.get_extension<QemuMemTxSecureTlmExtension>()) {
             attrs.non_secure = !secure->value;
+        }
+        if (const auto* user = txn.get_extension<QemuMemTxUserTlmExtension>()) {
+            attrs.privileged = !user->value;
         }
         return attrs;
     }
@@ -782,25 +949,29 @@ private:
             SCP_WARN(()) << "SMMU context fault: CB " << std::dec << cb << " SID 0x" << std::hex << req->sid << " VA 0x"
                          << req->va << " stage " << std::dec << req->stage << " level " << level << " reason "
                          << smmu500_fault_name(req->fault) << (req->walk_fault ? " during page-table walk" : "");
-            const uint64_t ipafar = req->ipafar_valid ? req->ipafar : req->va;
-            SMMU_CB_IPAFAR_LOW[cb] = static_cast<uint32_t>(ipafar);
-            SMMU_CB_IPAFAR_HIGH[cb] = static_cast<uint32_t>(ipafar >> 32);
-            if (req->stage == 2) {
-                SMMU_CB_FAR_LOW[cb] = static_cast<uint32_t>(req->va);
-                SMMU_CB_FAR_HIGH[cb] = static_cast<uint32_t>(req->va >> 32);
-            }
 
-            uint32_t syn = static_cast<uint32_t>(level) & 0x3;
-            syn |= (req->access == IOMMU_WO) ? (1u << 4) : 0;
-            syn |= req->privileged ? (1u << 5) : 0;
-            syn |= req->instruction ? (1u << 6) : 0;
-            syn |= req->non_secure ? (1u << 8) : 0;
-            syn |= req->address_translation ? (1u << 9) : 0;
-            syn |= req->walk_fault ? (1u << 10) : 0;
-            syn |= req->asynchronous ? (1u << 11) : 0;
+            const uint64_t ipafar = req->ipafar_valid ? req->ipafar : req->va;
+            SMMU_CB_IPAFAR_LOW[cb] = SMMU_LOW(ipafar);
+            SMMU_CB_IPAFAR_HIGH[cb] = SMMU_HIGH(ipafar);
+
+            const uint64_t far = req->nested ? req->client_va : req->va;
+            SMMU_CB_FAR_LOW[cb] = SMMU_LOW(far);
+            SMMU_CB_FAR_HIGH[cb] = SMMU_HIGH(far);
+
+            uint32_t syn = static_cast<uint32_t>(level) & 0x3; // PLVL
+            syn |= (req->stage == 2 && req->nested) ? (1u << 2) : 0; // NESTED
+            syn |= (req->stage == 2 && req->s1ptwf) ? (1u << 3) : 0; // S1PTWF
+            syn |= (req->access == IOMMU_WO) ? (1u << 4) : 0; // WNR
+            syn |= req->privileged ? (1u << 5) : 0; // PNU
+            syn |= req->instruction ? (1u << 6) : 0; // IND
+            syn |= req->non_secure ? (1u << 8) : 0; // NSATTR
+            syn |= req->address_translation ? (1u << 9) : 0; // ATOF
+            syn |= (req->walk_fault && req->fault == FaultKind::External) ? (1u << 10) : 0; // PTWF
+            syn |= req->asynchronous ? (1u << 11) : 0; // AFR
+
             if (req->stage == 1 || req->nested) {
                 const unsigned int s1_cb = req->nested ? req->s1_cb : cb;
-                syn |= (s1_cb & 0x7Fu) << 16;
+                syn |= (s1_cb & 0x7Fu) << 16; // S1CBNDX
             }
             SMMU_CB_FSYNR0[cb] = syn;
             SMMU_CB_FSYNR1[cb] = req->mid | (static_cast<uint32_t>(req->pid) << 8) |
@@ -904,11 +1075,9 @@ private:
         unsigned int ps;
         unsigned int baselowerbound;
         unsigned int stage = req->stage;
-        bool blocktranslate = false;
         bool epd = false;
-        uint32_t tableattrs = 0;
+        auto tableattrs = typename Desc::TableAttrs(0);
         uint32_t attrs;
-        uint32_t s2attrs;
         uint64_t descmask;
         uint64_t ttbr;
         uint64_t desc;
@@ -917,6 +1086,7 @@ private:
         uint64_t last_desc = 0;
         bool ttbr1 = false;
         bool have_descriptor = false;
+        std::optional<Desc> sdesc;
 
         req->err = false;
 
@@ -928,11 +1098,13 @@ private:
 
         ttbr = req->ttbr[stage][0];
         tg = extract32(req->tcr[stage], 14, 2);
+
         if (stage == 1) {
             ps = extract64(req->tcr[stage], 32, 3);
         } else {
             ps = extract64(req->tcr[stage], 16, 3);
         }
+
         t0sz = extract32(req->tcr[stage], 0, 6);
         tsz = t0sz;
         req->pa = req->va;
@@ -996,7 +1168,18 @@ private:
             goto do_fault;
         }
 
-        outputsize = outsize_map[ps];
+
+        if (SMMU_CBA2R[cb][CBA2R_VA64]) {
+            // 64 bits
+            outputsize = outsize_map[ps];
+        } else {
+            // 32 bits, as described in SMMU v2 chapter 3.7.2
+            const uint32_t idr2 = static_cast<uint32_t>(SMMU_SIDR2);
+            // IAS for stage 1, OAS otherwise
+            const unsigned encoding = extract32(idr2, stage == 1 ? 0 : 4, 4);
+            outputsize = std::min(40u, outsize_map[encoding]);
+        }
+
         if (outputsize > p_pamax) outputsize = p_pamax;
 
         stride = grainsize - 3;
@@ -1034,7 +1217,7 @@ private:
 
         /* Translation tables live in the SMMU physical address space. PS
          * constrains a completed translation, not the address of its tables. */
-        if (!check_out_addr(ttbr, p_pamax)) {
+        if (!check_out_addr(ttbr, outputsize)) {
             req->fault = FaultKind::AddressSize;
             goto do_fault;
         }
@@ -1047,20 +1230,23 @@ private:
             uint64_t descaddr = ttbr | index;
 
             if (req->stage == 1 && req->s2_enabled) {
+                // tanslation request to get descriptor IPA
                 TransReq s2req = *req;
                 s2req.stage = 2;
                 s2req.internal_walk = true;
                 s2req.va = descaddr;
                 s2req.access = IOMMU_RO;
+                s2req.s1ptwf = true;
+
                 smmu500_ptw64(s2req.s2_cb, &s2req);
+
                 if (s2req.err) {
-                    req->ipafar = descaddr;
-                    req->ipafar_valid = true;
-                    req->fault = s2req.fault;
-                    req->walk_fault = true;
-                    goto do_fault;
+                    // error while getting s1 descriptor addr
+                    *req = s2req;
+                    return;
+                } else {
+                    descaddr = s2req.pa;
                 }
-                descaddr = s2req.pa;
             }
 
             DmaDmi dma_dmi;
@@ -1068,9 +1254,11 @@ private:
                 std::lock_guard<std::mutex> lock(m_dma_dmi_lock);
                 dma_dmi = m_dma_dmi;
             }
+
             const bool descriptor_cached = dma_dmi.ptr != nullptr && dma_dmi.secure == !req->non_secure &&
                                            descaddr >= dma_dmi.start && descaddr <= dma_dmi.end &&
                                            dma_dmi.end - descaddr >= sizeof(desc) - 1;
+
             if (descriptor_cached) {
                 std::memcpy(&desc, dma_dmi.ptr + (descaddr - dma_dmi.start), sizeof(desc));
             } else if (!m_dma_on_sysc.is_on_sysc()) {
@@ -1117,6 +1305,8 @@ private:
                 goto do_fault;
             }
 
+            sdesc = Desc::from_raw(desc, level);
+
             last_descaddr = descaddr;
             last_desc = desc;
             have_descriptor = true;
@@ -1131,7 +1321,7 @@ private:
             ttbr = extract64(desc, 0, 48);
             ttbr &= ~descmask;
 
-            if (!(type & 2) && level == 3) {
+            if (level == 3 && !sdesc) {
                 SCP_INFO(()) << "bad level 3 desc";
                 req->walk_fault = true;
                 goto do_fault;
@@ -1139,30 +1329,31 @@ private:
 
             if (level == 3) break;
 
-            switch (type) {
-            case 2:
-            case 0:
+            if (sdesc) {
+                switch (sdesc->type()) {
+                    case Desc::Type::Block: {
+                        if (level < static_cast<int>(firstblocklevel)) {
+                            req->walk_fault = true;
+                            goto do_fault;
+                        }
+                        break;
+                    }
+                    case Desc::Type::Table: {
+                        tableattrs |= sdesc->table_attrs();
+                        if (!check_out_addr(ttbr, outputsize)) {
+                            req->fault = FaultKind::AddressSize;
+                            goto do_fault;
+                        }
+                        level++;
+                        break;
+                    }
+                }
+            } else {
                 SCP_INFO(()) << "bad desc id " << req->trace_id << " SID 0x" << std::hex << req->sid << " CB " << cb;
                 req->walk_fault = true;
                 goto do_fault;
-                break;
-            case 1:
-                blocktranslate = true;
-                if (level < static_cast<int>(firstblocklevel)) {
-                    req->walk_fault = true;
-                    goto do_fault;
-                }
-                break;
-            case 3:
-                tableattrs |= extract64(desc, 59, 5);
-                if (!check_out_addr(ttbr, p_pamax)) {
-                    req->fault = FaultKind::AddressSize;
-                    goto do_fault;
-                }
-                level++;
-                break;
             }
-        } while (!blocktranslate);
+        } while (sdesc->type() != Desc::Type::Block);
 
         if (!check_out_addr(ttbr, outputsize)) {
             req->fault = FaultKind::AddressSize;
@@ -1174,67 +1365,86 @@ private:
             page_size = (1ULL << ((stride * (4 - level)) + 3));
             ttbr |= (walk_va & (page_size - 1));
             req->page_size = ((stride * (4 - level)) + 3);
-        }
+            req->prot = IOMMU_RW;
 
-        s2attrs = attrs = extract64(desc, 2, 10) | (extract64(desc, 52, 12) << 10);
-        if (req->stage == 1) {
-            attrs |= extract32(tableattrs, 0, 2) << 11;
-            attrs |= extract32(tableattrs, 3, 1) << 5;
-            if (0 && extract32(tableattrs, 2, 1)) {
-                attrs &= ~(1 << 4);
-            }
-        }
+            if (req->stage == 1) {
+                const auto s1attrs = sdesc->stage1_attrs();
 
-        req->prot = IOMMU_RW;
-        if ((attrs & (1 << 8)) == 0) {
-            SCP_INFO(()) << "access forbidden " << std::hex << attrs;
-            req->fault = FaultKind::AccessFlag;
-            goto do_fault;
-        }
+                if (!s1attrs.access_flag()) {
+                    SCP_INFO(()) << "access forbidden " << std::hex << desc;
+                    req->fault = FaultKind::AccessFlag;
+                    goto do_fault;
+                }
 
-        if (req->stage == 1) {
-            const bool unprivileged_access = !req->privileged;
-            const bool user_access = (attrs & (1 << 4)) != 0;
-            if (unprivileged_access && !user_access) {
-                SCP_INFO(()) << "Unprivileged access forbidden by AP[1]";
-                req->fault = FaultKind::Permission;
-                goto do_fault;
-            }
-            if (attrs & (1 << 5)) {
-                if (req->access == IOMMU_WO) {
-                    SCP_INFO(()) << "Write access forbidden " << std::hex << attrs;
+                const bool allow_user = s1attrs.allow_user() && !tableattrs.deny_user();
+                const bool allow_write = !s1attrs.read_only() && !tableattrs.deny_write();
+                const bool pxn = s1attrs.pxn() || tableattrs.pxn();
+                const bool xn = s1attrs.xn() || tableattrs.xn();
+                const auto sctlr = static_cast<std::uint32_t>(SMMU_CB_SCTLR[cb]);
+                const bool wxn = sctlr & (1 << 9);
+                const bool uwxn = sctlr & (1 << 10);
+
+                const bool exec_denied =
+                       xn
+                    || (req->privileged && pxn)
+                    || (wxn && allow_write)
+                    || (uwxn && allow_user && allow_write);
+
+                if ((!req->privileged && !allow_user)
+                 || (req->instruction && exec_denied)) {
+                    SCP_INFO(()) << "Unprivileged access forbidden by AP[1]";
                     req->fault = FaultKind::Permission;
                     goto do_fault;
                 }
-                req->prot &= ~IOMMU_WO;
-            }
-        } else {
-            switch ((s2attrs >> 4) & 3) {
-            case 0:
-                req->fault = FaultKind::Permission;
-                goto do_fault;
-                break;
-            case 1:
-                if (req->access == IOMMU_WO) {
-                    req->fault = FaultKind::Permission;
-                    goto do_fault;
-                }
-                req->prot &= ~IOMMU_WO;
-                break;
-            case 2:
-                if (req->access == IOMMU_RO) {
-                    req->fault = FaultKind::Permission;
-                    goto do_fault;
-                }
-                req->prot &= ~IOMMU_RO;
-                break;
-            case 3:
-                break;
-            }
-        }
 
-        req->pa = ttbr;
-        return;
+                if (!allow_write) {
+                    if (req->access == IOMMU_WO) {
+                        SCP_INFO(()) << "Write access forbidden " << std::hex << desc;
+                        req->fault = FaultKind::Permission;
+                        goto do_fault;
+                    }
+
+                    req->prot &= ~IOMMU_WO;
+                }
+            } else {
+                const auto s2attrs = sdesc->stage2_attrs();
+
+                if (!s2attrs.access_flag()) {
+                    SCP_INFO(()) << "access forbidden " << std::hex << desc;
+                    req->fault = FaultKind::AccessFlag;
+                    goto do_fault;
+                }
+
+                if (req->instruction && !req->internal_walk && s2attrs.xn()) {
+                    SCP_INFO(()) << "Unprivileged access forbidden by AP[1]";
+                    req->fault = FaultKind::Permission;
+                    goto do_fault;
+                }
+
+                switch (s2attrs.access()) {
+                    case Desc::Stage2Access::None:
+                        req->prot = IOMMU_NONE;
+                        break;
+                    case Desc::Stage2Access::ReadOnly:
+                        req->prot = IOMMU_RO;
+                        break;
+                    case Desc::Stage2Access::WriteOnly:
+                        req->prot = IOMMU_WO;
+                        break;
+                    case Desc::Stage2Access::ReadWrite:
+                        req->prot = IOMMU_RW;
+                        break;
+                }
+
+                if ((req->prot & req->access) != req->access) {
+                    req->fault = FaultKind::Permission;
+                    goto do_fault;
+                }
+            }
+
+            req->pa = ttbr;
+            return;
+        }
 
     do_fault:
         if (req->walk_fault && have_descriptor) {
@@ -1246,14 +1456,28 @@ private:
         dump_cb_state(cb);
         dump_state();
         req->err = true;
-        if (!req->internal_walk && !req->suppress_fault) {
-            const unsigned int fault_cb = (req->nested && req->stage == 2) ? req->s1_cb : cb;
-            smmu500_fault(fault_cb, req, level);
+        req->fault_level = level;
+        if (!req->suppress_fault) {
+            smmu500_fault(cb, req, level);
         }
     }
 
-    bool smmu500_at64(unsigned int cb, uint64_t va, bool wr, bool s2, uint64_t* pa, int* prot, uint64_t* page_size,
-                      uint64_t* fault_addr, const FaultAttrs& fault_attrs, uint64_t trace_id = 0, uint64_t sid = 0)
+    struct smmu500_at_params {
+        unsigned int cb;
+        uint64_t va;
+        bool wr;
+        bool s2;
+        uint64_t* pa;
+        int* prot;
+        uint64_t* page_size;
+        uint64_t* fault_addr;
+        const FaultAttrs& fault_attrs;
+        uint64_t trace_id = 0;
+        uint64_t sid = 0;
+        TransReq* res = nullptr;
+    };
+
+    bool smmu500_at64(const smmu500_at_params& p)
     {
         unsigned int s2_cb = 0;
         const unsigned int nr_cb = std::min<unsigned int>(p_num_cb, SMMU_MAX_CB);
@@ -1262,69 +1486,70 @@ private:
         int s1_prot = IOMMU_RW;
         uint64_t s1_page_size;
 
-        t = SMMU_CBAR[cb][CBAR_TYPE];
-
-        switch (t) {
-        case 0:
-            req.stage = 2;
-            req.s2_enabled = true;
-            req.s2_cb = cb;
-            s2_cb = cb;
-            break;
-        case 1:
-            req.stage = 1;
-            req.s2_enabled = false;
-            break;
-        case 2:
-            req.stage = 1;
-            req.s2_enabled = false;
-            break;
-        case 3:
-            req.stage = 1;
-            req.s2_enabled = true;
-            req.s2_cb = SMMU_CBAR[cb][CBAR_S2_CBNDX];
-            req.nested = true;
-            req.s1_cb = cb;
-            s2_cb = req.s2_cb;
-            break;
+        const auto type = static_cast<CBARType>(static_cast<std::uint32_t>(SMMU_CBAR[p.cb][CBAR_TYPE]));
+        switch (type) {
+            case CBARType::Stage2Ctx:
+                req.stage = 2;
+                req.s2_enabled = true;
+                req.s2_cb = p.cb;
+                s2_cb = p.cb;
+                break;
+            case CBARType::Stage1CtxStage2Bypass:
+                req.stage = 1;
+                req.s2_enabled = false;
+                break;
+            case CBARType::Stage1CtxStage2Fault:
+                req.stage = 1;
+                req.s2_enabled = false;
+                break;
+            case CBARType::Stage1AndStage2Ctx:
+                req.stage = 1;
+                req.s2_enabled = true;
+                req.s2_cb = SMMU_CBAR[p.cb][CBAR_S2_CBNDX];
+                req.nested = true;
+                req.s1_cb = p.cb;
+                s2_cb = req.s2_cb;
+                break;
         }
 
-        req.va = va;
-        req.trace_id = trace_id;
-        req.sid = sid;
-        req.tcr[1] = static_cast<uint32_t>(SMMU_CB_TCR2[cb]);
+        req.va = p.va;
+        req.client_va = p.va;
+        req.trace_id = p.trace_id;
+        req.sid = p.sid;
+        req.tcr[1] = static_cast<uint32_t>(SMMU_CB_TCR2[p.cb]);
         req.tcr[1] <<= 32;
-        req.tcr[1] |= static_cast<uint32_t>(SMMU_CB_TCR_LPAE[cb]);
+        req.tcr[1] |= static_cast<uint32_t>(SMMU_CB_TCR_LPAE[p.cb]);
 
-        req.ttbr[1][0] = smmu500_ttbr(static_cast<uint32_t>(SMMU_CB_TTBR0_HIGH[cb]),
-                                      static_cast<uint32_t>(SMMU_CB_TTBR0_LOW[cb]));
+        req.ttbr[1][0] = smmu500_ttbr(static_cast<uint32_t>(SMMU_CB_TTBR0_HIGH[p.cb]),
+                                      static_cast<uint32_t>(SMMU_CB_TTBR0_LOW[p.cb]));
 
-        req.ttbr[1][1] = smmu500_ttbr(static_cast<uint32_t>(SMMU_CB_TTBR1_HIGH[cb]),
-                                      static_cast<uint32_t>(SMMU_CB_TTBR1_LOW[cb]));
+        req.ttbr[1][1] = smmu500_ttbr(static_cast<uint32_t>(SMMU_CB_TTBR1_HIGH[p.cb]),
+                                      static_cast<uint32_t>(SMMU_CB_TTBR1_LOW[p.cb]));
 
-        req.access = wr ? IOMMU_WO : IOMMU_RO;
-        req.page_size = *page_size;
+        req.access = p.wr ? IOMMU_WO : IOMMU_RO;
+        req.page_size = *p.page_size;
         s1_page_size = req.page_size;
-        req.privileged = fault_attrs.privileged;
-        req.instruction = fault_attrs.instruction;
-        req.non_secure = fault_attrs.non_secure;
-        req.address_translation = fault_attrs.address_translation;
-        req.asynchronous = fault_attrs.asynchronous;
-        req.suppress_fault = fault_attrs.suppress_fault;
-        req.mid = fault_attrs.mid;
-        req.pid = fault_attrs.pid;
-        req.bid = fault_attrs.bid;
+        req.privileged = p.fault_attrs.privileged;
+        req.instruction = p.fault_attrs.instruction;
+        req.non_secure = p.fault_attrs.non_secure;
+        req.address_translation = p.fault_attrs.address_translation;
+        req.asynchronous = p.fault_attrs.asynchronous;
+        req.suppress_fault = p.fault_attrs.suppress_fault;
+        req.mid = p.fault_attrs.mid;
+        req.pid = p.fault_attrs.pid;
+        req.bid = p.fault_attrs.bid;
 
         if (req.s2_enabled && req.s2_cb >= nr_cb) {
             req.err = true;
             req.fault = FaultKind::Translation;
-            req.pa = va;
+            req.pa = p.va;
             req.prot = IOMMU_NONE;
-            if (!req.suppress_fault) smmu500_fault(cb, &req, 0);
-            *pa = req.pa;
-            *prot = req.prot;
-            *page_size = req.page_size;
-            if (fault_addr) *fault_addr = va;
+            if (!req.suppress_fault) smmu500_fault(p.cb, &req, 0);
+            *p.pa = req.pa;
+            *p.prot = req.prot;
+            *p.page_size = req.page_size;
+            if (p.fault_addr) *p.fault_addr = p.va;
+            if (p.res) *p.res = req;
             return true;
         }
 
@@ -1335,7 +1560,7 @@ private:
         }
 
         if (req.stage == 1) {
-            smmu500_ptw64(cb, &req);
+            smmu500_ptw64(p.cb, &req);
             if (!req.err) {
                 s1_prot = req.prot;
                 s1_page_size = req.page_size;
@@ -1345,7 +1570,7 @@ private:
             req.pa = req.va;
         }
 
-        if (!req.err && s2 && req.s2_enabled) {
+        if (!req.err && p.s2 && req.s2_enabled) {
             req.va = req.pa;
             /* A nested context uses the CBAR-selected stage-2 context for
              * the final walk as well as for translating stage-1 descriptors. */
@@ -1356,24 +1581,24 @@ private:
             }
         }
 
-        *pa = req.pa;
-        *prot = req.prot;
-        *page_size = req.page_size;
-        if (fault_addr) *fault_addr = req.ipafar_valid ? req.ipafar : (req.err ? req.va : va);
+        *p.pa = req.pa;
+        *p.prot = req.prot;
+        *p.page_size = req.page_size;
+        if (p.fault_addr) *p.fault_addr = req.ipafar_valid ? req.ipafar : (req.err ? req.va : p.va);
+        if (p.res) *p.res = req;
         return req.err;
     }
 
-    bool smmu500_at(unsigned int cb, uint64_t va, bool wr, bool s2, uint64_t* pa, int* prot, uint64_t* page_size,
-                    uint64_t* fault_addr, const FaultAttrs& fault_attrs, uint64_t trace_id = 0, uint64_t sid = 0)
+    bool smmu500_at(const smmu500_at_params& params)
     {
-        return smmu500_at64(cb, va, wr, s2, pa, prot, page_size, fault_addr, fault_attrs, trace_id, sid);
+        return smmu500_at64(params);
     }
 
     void smmu500_gat(uint64_t v, bool wr, bool s2, bool unprivileged, bool non_secure = false)
     {
         std::lock_guard<std::recursive_mutex> translation_lock(m_translation_lock);
-        uint64_t va = v & ~SMMU_ADDRMASK;
-        unsigned int cb = v & SMMU_ADDRMASK;
+        uint64_t va = v & SMMU_ADDRMASK;
+        unsigned int cb = v & SMMU_OFFSETMASK;
         uint64_t pa;
         int prot;
         uint64_t page_size = 12; // log2 default page size: 4 KiB
@@ -1381,28 +1606,53 @@ private:
         fault_attrs.privileged = !unprivileged;
         fault_attrs.non_secure = non_secure;
         fault_attrs.address_translation = true;
+        fault_attrs.suppress_fault = true;
 
         if (cb >= p_num_cb) {
-            smmu500_record_global_fault(1u << 0, non_secure);
+            constexpr std::uint64_t unimpl_ctx_fault = (1 << 30) | 1;
             if (non_secure) {
-                smmu500_non_secure_gr0_write32(SMMU_GPAR.get_offset(), 1);
+                smmu500_non_secure_gr0_write32(SMMU_GPAR.get_offset(), unimpl_ctx_fault);
                 smmu500_non_secure_gr0_write32(SMMU_GPAR_H.get_offset(), 0);
             } else {
-                SMMU_GPAR = 1;
+                SMMU_GPAR = unimpl_ctx_fault;
                 SMMU_GPAR_H = 0;
             }
             return;
         }
 
         SCP_INFO(()) << "ATS: va=0x" << std::hex << va << " cb=0x" << cb << " wr=" << wr << " s2=" << s2;
-        bool err = smmu500_at(cb, va, wr, s2, &pa, &prot, &page_size, nullptr, fault_attrs);
+        TransReq res{};
+        const auto params = smmu500_at_params {
+            .cb = cb,
+            .va = va,
+            .wr = wr,
+            .s2 = s2,
+            .pa = &pa,
+            .prot = &prot,
+            .page_size = &page_size,
+            .fault_addr = nullptr,
+            .fault_attrs = fault_attrs,
+            .res = &res,
+        };
+        bool err = smmu500_at(params);
+
+        std::uint64_t gpar = pa;
+        if (err) {
+            const unsigned fault_cb = res.stage == 2 ? res.s2_cb : cb;
+            const std::uint32_t fmt = SMMU_CBA2R[fault_cb][CBA2R_VA64] ? 0b10 : 0b01;
+            const std::uint32_t fault_status = smmu500_fault_status(res.fault);
+
+            gpar = (fmt << 8) | fault_status | 1;
+            gpar |= static_cast<std::uint64_t>(res.fault_level & 3) << 32;
+            gpar |= static_cast<std::uint64_t>(res.stage == 2) << 35;
+        }
 
         if (non_secure) {
-            smmu500_non_secure_gr0_write32(SMMU_GPAR.get_offset(), static_cast<uint32_t>(pa | err));
-            smmu500_non_secure_gr0_write32(SMMU_GPAR_H.get_offset(), static_cast<uint32_t>(pa >> 32));
+            smmu500_non_secure_gr0_write32(SMMU_GPAR.get_offset(), static_cast<uint32_t>(gpar));
+            smmu500_non_secure_gr0_write32(SMMU_GPAR_H.get_offset(), static_cast<uint32_t>(gpar >> 32));
         } else {
-            SMMU_GPAR = static_cast<uint32_t>(pa | err);
-            SMMU_GPAR_H = static_cast<uint32_t>(pa >> 32);
+            SMMU_GPAR = static_cast<uint32_t>(gpar);
+            SMMU_GPAR_H = static_cast<uint32_t>(gpar >> 32);
         }
     }
 
@@ -1425,13 +1675,13 @@ public:
     }
 
     uint16_t smmu500_resolve_stream_id(uint32_t topology_id, uint64_t addr, int* cb,
-                                       bool* stream_match_conflict = nullptr, uint32_t* s2cr_type = nullptr,
+                                       bool* stream_match_conflict = nullptr, S2CRType* s2cr_type = nullptr,
                                        bool address_carries_csid = true)
     {
         std::lock_guard<std::recursive_mutex> translation_lock(m_translation_lock);
         const uint16_t stream_id = smmu500_compose_stream_id(topology_id, addr, address_carries_csid);
         bool conflict = false;
-        uint32_t type = 0;
+        S2CRType type = S2CRType::Fault;
         const int resolved_cb = smmu500_stream_id_match(stream_id, &conflict, &type);
         if (cb) *cb = resolved_cb;
         if (stream_match_conflict) *stream_match_conflict = conflict;
@@ -1443,42 +1693,44 @@ public:
                                     bool record_fault = true)
     {
         std::lock_guard<std::recursive_mutex> translation_lock(m_translation_lock);
+
         const uint64_t trace_id = ++m_translation_seq;
-        uint64_t addr = txn.get_address();
+        const unsigned int nr_cb = std::min<unsigned int>(p_num_cb, SMMU_MAX_CB);
+        uint64_t raw_addr = txn.get_address();
+        auto addr = SMMUAddr{raw_addr};
+
         uint64_t page_size = 12;
         IOMMUTLBEntry ret = {
             /* Keep the request address in the TLB entry.  Consumers use this
              * to associate the translated page with the upstream IOVA. */
-            .iova = addr,
-            .translated_addr = addr,
+            .iova = raw_addr,
+            .translated_addr = raw_addr,
             .addr_mask = (1ULL << page_size) - 1,
             .perm = IOMMU_RW,
         };
-        int cb;
+
         /* Legacy TBU traffic encodes CSID[3:0] in address bits [35:32]. A
          * genuine high VA cannot use that encoding, so retain it in full and
          * select the configured CSID instead. */
-        const bool address_carries_csid = transport_stream_address && (addr >> 36) == 0;
-        uint64_t va = addr & ~SMMU_ADDRMASK;
-        if (address_carries_csid) {
-            va &= ((1ULL << SMMU_VA_WIDTH) - 1);
-        }
+        const bool address_carries_csid = transport_stream_address && !addr.is_high_addr();
+        uint64_t va = address_carries_csid ? addr.va() : raw_addr;
         uint64_t pa = va;
-        int prot;
-        uint64_t fault_addr = va;
-        bool err = false;
-        const uint16_t master_id = smmu500_compose_stream_id(static_cast<uint32_t>(sid), addr, address_carries_csid);
+
+        const uint16_t master_id = smmu500_compose_stream_id(static_cast<uint32_t>(sid), raw_addr, address_carries_csid);
         const uint32_t transport_stream_bits = address_carries_csid ? static_cast<uint32_t>(master_id & 0xfu) : 0;
         const FaultAttrs fault_attrs = smmu500_extract_fault_attrs(txn, record_fault);
         const uint32_t global_control = smmu500_global_control(fault_attrs.non_secure);
+
         bool stream_match_conflict = false;
-        uint32_t s2cr_type = 0;
-        cb = smmu500_stream_id_match(master_id, &stream_match_conflict, &s2cr_type);
-        if (transport_stream_address && (addr >> 36) != 0) {
-            SCP_INFO(()) << std::hex << "SMMU high-VA TBU request id " << trace_id << " address 0x" << addr
+        S2CRType s2cr_type = S2CRType::TcbIdx;
+        int cb = smmu500_stream_id_match(master_id, &stream_match_conflict, &s2cr_type);
+
+        if (transport_stream_address && addr.is_high_addr()) {
+            SCP_INFO(()) << std::hex << "SMMU high-VA TBU request id " << trace_id << " address 0x" << raw_addr
                          << " configured SID 0x" << sid << " effective SID 0x" << master_id << " CSID carrier "
-                         << address_carries_csid << " CB " << cb << " S2CR type " << s2cr_type;
+                         << address_carries_csid << " CB " << cb << " S2CR type " << static_cast<unsigned>(s2cr_type);
         }
+
         bool clientpd = global_control & SCR0_CLIENTPD_MASK;
         if (clientpd) {
             ret.addr_mask = -1;
@@ -1486,19 +1738,15 @@ public:
         }
 
         if (cb < 0) {
-            /* USFCFG selects whether unidentified streams generate a global
-             * fault. GFRE selects whether that recorded fault rejects the
-             * transaction or permits a bypass response. A TBU request with
-             * no transport carrier has no CSID to match; preserve the
-             * identity boot traffic instead of turning it into a fault. */
-            const bool has_transport_csid = address_carries_csid && ((addr >> 32) & 0xfu) != 0;
-            if ((global_control & SCR0_USFCFG_MASK) && (!transport_stream_address || has_transport_csid)) {
+            if (global_control & SCR0_USFCFG_MASK) {
                 smmu500_report_global_fault(ret, 1u << 1, fault_attrs.non_secure, global_control, record_fault);
             } else {
                 ret.addr_mask = -1;
             }
+
             return ret;
         }
+
         if (stream_match_conflict) {
             if (global_control & SCR0_SMCFCFG_MASK) {
                 smmu500_report_global_fault(ret, 1u << 2, fault_attrs.non_secure, global_control, record_fault);
@@ -1506,50 +1754,73 @@ public:
             }
         }
 
-        /* S2CR.TYPE selects the action for a matched stream. */
-        if (s2cr_type == 1) { // Bypass
+        if (s2cr_type == S2CRType::Bypass) {
             ret.addr_mask = -1;
             return ret;
         }
-        const unsigned int nr_cb = std::min<unsigned int>(p_num_cb, SMMU_MAX_CB);
-        if (s2cr_type != 0 || cb >= static_cast<int>(nr_cb)) { // Fault/reserved/invalid context
+
+        if (cb >= static_cast<int>(nr_cb)) {
             smmu500_report_global_fault(ret, 1u << 0, fault_attrs.non_secure, global_control, record_fault);
             return ret;
         }
+
+        const CBARType cbar_type = CBARType(static_cast<std::uint32_t>(SMMU_CBAR[cb][CBAR_TYPE]));
+        if (s2cr_type != S2CRType::TcbIdx) { // Fault/reserved/invalid context
+            smmu500_report_global_fault(ret, 1u << 0, fault_attrs.non_secure, global_control, record_fault);
+            return ret;
+        }
+
         if (!SMMU_CBA2R[cb][CBA2R_VA64]) {
             va &= ((1ULL << SMMU_VA_WIDTH) - 1);
         }
 
         bool wr = (txn.get_command() == tlm::TLM_WRITE_COMMAND);
-        const bool fault_latched = (static_cast<uint32_t>(SMMU_CB_FSR[cb]) & CB_FSR_FAULT_MASK) != 0;
+        // const bool fault_latched = (static_cast<uint32_t>(SMMU_CB_FSR[cb]) & CB_FSR_FAULT_MASK) != 0;
         /* A later fault must still reach smmu500_fault so the TRM-defined
          * MULTI status bit is set. Only non-recording probes, such as DMI
          * lookups, suppress fault status updates. */
-        err = smmu500_at(cb, va, wr, true, &pa, &prot, &page_size, &fault_addr, fault_attrs, trace_id, master_id);
+        int prot;
+
+        const auto params = smmu500_at_params {
+            .cb = static_cast<unsigned>(cb),
+            .va = va,
+            .wr = wr,
+            .s2 = true,
+            .pa = &pa,
+            .prot = &prot,
+            .page_size = &page_size,
+            .fault_addr = nullptr,
+            .fault_attrs = fault_attrs,
+            .trace_id = trace_id,
+            .sid = master_id,
+        };
+        const bool err = smmu500_at(params);
+
         ret.translated_addr = pa;
         ret.perm = (IOMMUAccessFlags)prot;
         if (err) {
-            if (record_fault && !fault_latched) {
-                const uint64_t recorded_addr = (fault_addr == va) ? (va | (addr & SMMU_PAGEMASK)) : fault_addr;
-                SMMU_CB_IPAFAR_LOW[cb] = static_cast<uint32_t>(recorded_addr);
-                SMMU_CB_IPAFAR_HIGH[cb] = static_cast<uint32_t>(recorded_addr >> 32);
-                if (SMMU_CBAR[cb][CBAR_TYPE] == 0 || SMMU_CBAR[cb][CBAR_TYPE] == 3) {
-                    SMMU_CB_FAR_LOW[cb] = static_cast<uint32_t>(recorded_addr);
-                    SMMU_CB_FAR_HIGH[cb] = static_cast<uint32_t>(recorded_addr >> 32);
-                }
-            }
+            // if (record_fault && !fault_latched) {
+            //     const uint64_t recorded_addr = (fault_addr == va) ? (va | (raw_addr & SMMU_PAGEMASK)) : fault_addr;
+            //     SMMU_CB_IPAFAR_LOW[cb] = static_cast<uint32_t>(recorded_addr);
+            //     SMMU_CB_IPAFAR_HIGH[cb] = static_cast<uint32_t>(recorded_addr >> 32);
+            //     if (cbar_type == CBARType::Stage2Ctx || cbar_type == CBARType::Stage1AndStage2Ctx) {
+            //         SMMU_CB_FAR_LOW[cb] = static_cast<uint32_t>(recorded_addr);
+            //         SMMU_CB_FAR_HIGH[cb] = static_cast<uint32_t>(recorded_addr >> 32);
+            //     }
+            // }
             memset(&ret, 0, sizeof ret);
-            ret.iova = addr;
+            ret.iova = raw_addr;
             ret.perm = IOMMU_NONE;
         } else {
             ret.addr_mask = (page_size >= 64) ? UINT64_MAX : ((1ULL << page_size) - 1);
             ret.translated_addr &= ~ret.addr_mask;
         }
+
         return ret;
     }
 
     int smmu500_stream_id_match(uint32_t stream_id, bool* stream_match_conflict = nullptr,
-                                uint32_t* s2cr_type = nullptr)
+                                S2CRType* s2cr_type = nullptr)
     {
         const uint32_t effective_stream_id = stream_id & SMMU_STREAM_ID_MASK;
         /* SIDR0.NUMSMRG is an 8-bit architectural identification field.
@@ -1558,7 +1829,7 @@ public:
         const unsigned int nr_smr = std::min<unsigned int>(static_cast<unsigned int>(p_num_smr), SMMU_MAX_SMR);
         int cbndx = -1;
         bool conflict = false;
-        uint32_t type = 0;
+        S2CRType type = S2CRType::TcbIdx;
 
         for (unsigned int i = 0; i < nr_smr; i++) {
             bool valid = SMMU_SMR[i][SMR_VALID];
@@ -1568,7 +1839,7 @@ public:
             if (valid && ((id ^ effective_stream_id) & ~mask & SMMU_STREAM_ID_MASK) == 0) {
                 if (cbndx < 0) {
                     cbndx = static_cast<int>(SMMU_S2CR[i][S2CR_CBNDX_VMID]);
-                    type = static_cast<uint32_t>(SMMU_S2CR[i][S2CR_TYPE]);
+                    type = S2CRType(static_cast<std::uint32_t>(SMMU_S2CR[i][S2CR_TYPE]));
                 } else {
                     conflict = true;
                 }
@@ -1638,10 +1909,18 @@ class smmu500_tbu : public sc_core::sc_module
             [this](qemu::IOMMUMemoryRegion::IOMMUTLBEntry* te, uint64_t addr,
                    qemu::IOMMUMemoryRegion::IOMMUAccessFlags flags,
                    int idx) { smmu500_qemu_translate(*te, addr, flags, idx); },
-            [](qemu::MemoryRegionOps::MemTxAttrs attrs) { return attrs.secure ? 1 : 0; }, [] { return 2; },
+            [](qemu::MemoryRegionOps::MemTxAttrs attrs) {
+                int idx = 0;
+                idx |= attrs.secure ? 1 : 0;
+                idx |= attrs.user   ? 2 : 0;
+
+                return idx;
+            }, [] { return 4; },
             [](int idx) {
                 qemu::MemoryRegionOps::MemTxAttrs attrs;
-                attrs.secure = idx != 0;
+                attrs.secure    = (idx & 1) != 0;
+                attrs.user      = (idx & 2) != 0;
+
                 return attrs;
             });
         downstream_socket.init(*region.mr);
@@ -1683,22 +1962,24 @@ class smmu500_tbu : public sc_core::sc_module
                         : (flags & qemu::IOMMUMemoryRegion::IOMMU_WO) ? tlm::TLM_WRITE_COMMAND
                                                                       : tlm::TLM_READ_COMMAND);
         QemuMemTxAttrExtensions attrs(txn, region.mr->attrs_for_index(idx));
-        typename smmu500<BUSWIDTH>::IOMMUTLBEntry te{};
+        typename smmu500<BUSWIDTH>::IOMMUTLBEntry tlb_entry{};
         const bool record_fault = flags == qemu::IOMMUMemoryRegion::IOMMU_RO ||
                                   flags == qemu::IOMMUMemoryRegion::IOMMU_WO;
+
         try {
-            te = m_smmu->smmu500_translate(txn, p_topology_id, true, record_fault);
+            tlb_entry = m_smmu->smmu500_translate(txn, p_topology_id, true, record_fault);
         } catch (const typename smmu500<BUSWIDTH>::DmaDmiMiss&) {
             auto& inst = m_qemu_instance->get();
             const bool iothread_locked = inst.is_iothread_locked();
             if (iothread_locked) inst.unlock_iothread();
             m_smmu->m_dma_on_sysc.run_on_sysc(
-                [&, record_fault] { te = m_smmu->smmu500_translate(txn, p_topology_id, true, record_fault); });
+                [&, record_fault] { tlb_entry = m_smmu->smmu500_translate(txn, p_topology_id, true, record_fault); });
             if (iothread_locked) inst.lock_iothread();
         }
-        if (te.perm == smmu500<BUSWIDTH>::IOMMU_NONE) return;
-        const uint64_t pa = (te.translated_addr & ~te.addr_mask) | (iova & te.addr_mask);
-        uint64_t mask = te.addr_mask;
+
+        if (tlb_entry.perm == smmu500<BUSWIDTH>::IOMMU_NONE) return;
+        const uint64_t pa = (tlb_entry.translated_addr & ~tlb_entry.addr_mask) | (iova & tlb_entry.addr_mask);
+        uint64_t mask = tlb_entry.addr_mask;
         const bool transport_csid = (iova >> 36) == 0;
         const uint64_t csid_window_mask = static_cast<uint64_t>(UINT32_MAX);
         const uint64_t csid_window_end = (iova & ~csid_window_mask) | csid_window_mask;
@@ -1711,7 +1992,7 @@ class smmu500_tbu : public sc_core::sc_module
         translated.iova = addr & ~mask;
         translated.translated_addr = pa & ~mask;
         translated.addr_mask = mask;
-        switch (te.perm) {
+        switch (tlb_entry.perm) {
         case smmu500<BUSWIDTH>::IOMMU_RO:
             translated.perm = qemu::IOMMUMemoryRegion::IOMMU_RO;
             break;
